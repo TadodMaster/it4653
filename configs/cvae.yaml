@@ -1,0 +1,31 @@
+# Conditional VAE configuration
+model:
+  name: "cvae"
+  latent_dim: 32
+  num_classes: 10         # 10 for MNIST digits
+  image_channels: 1
+  image_size: 28
+  beta: 1.0
+  # Conditional: labels embedded as one-hot or learned embedding
+  label_embedding_dim: 32
+
+dataset:
+  name: "mnist"
+  data_root: "./data"
+  batch_size: 128
+  image_size: 28
+  # If using celeba: use attribute label instead of digit
+
+training:
+  num_epochs: 50
+  lr: 0.001
+  optimizer: "adam"
+  weight_decay: 0.0
+  device: "cuda"
+  save_every: 10
+
+logging:
+  log_dir: "./outputs/logs/cvae"
+  checkpoint_dir: "./outputs/checkpoints/cvae"
+  image_dir: "./outputs/generated_images/cvae"
+  use_tensorboard: true
