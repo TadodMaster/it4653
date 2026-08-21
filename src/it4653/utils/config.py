@@ -1,8 +1,6 @@
 ﻿"""Configuration loading helpers.
 
-Loads YAML configs and returns simple dicts/dataclasses.
-
-Placeholder for implementation.
+Loads YAML configs and returns plain dicts.
 """
 
 from __future__ import annotations

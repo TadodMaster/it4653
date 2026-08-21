@@ -1,26 +1,25 @@
-# Conditional VAE configuration
+# Conditional Variational Autoencoder configuration
 model:
   name: "cvae"
-  latent_dim: 32
-  num_classes: 10         # 10 for MNIST digits
+  latent_dim: 32          # Also sweep: [2, 8, 32, 128]
+  num_classes: 10         # MNIST / Fashion-MNIST
   image_channels: 1
   image_size: 28
-  beta: 1.0
-  # Conditional: labels embedded as one-hot or learned embedding
-  label_embedding_dim: 32
+  beta: 1.0               # KL weight
+  label_embed_dim: 8      # Dense embedding size for one-hot labels
 
 dataset:
-  name: "mnist"
+  name: "fashion-mnist"  # or "mnist"
   data_root: "./data"
   batch_size: 128
   image_size: 28
-  # If using celeba: use attribute label instead of digit
 
 training:
   num_epochs: 50
   lr: 0.001
   optimizer: "adam"
   weight_decay: 0.0
+  scheduler: null
   device: "cuda"
   save_every: 10
 
