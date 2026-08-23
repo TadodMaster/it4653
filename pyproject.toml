@@ -1,71 +1,62 @@
-[build-system]
-requires = ["setuptools>=61", "wheel"]
-build-backend = "setuptools.build_meta"
-
 [project]
-name = "it4653-vae"
+name = "vae-mnist"
 version = "0.1.0"
-description = "Variational Autoencoder (VAE) and Conditional VAE for IT4653"
+description = "Convolutional VAE on MNIST with KL warmup, GMM sampling, and FID evaluation"
 readme = "README.md"
 requires-python = ">=3.10"
-license = {text = "MIT"}
-authors = [
-    {name = "Student", email = "student@example.com"},
-]
-keywords = ["deep-learning", "vae", "cvae", "variational-autoencoder", "generative-models", "pytorch"]
-classifiers = [
-    "Development Status :: 3 - Alpha",
-    "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
-    "Topic :: Scientific/Engineering :: Artificial Intelligence",
-]
 
 dependencies = [
-    "torch>=2.0.0",
-    "torchvision>=0.15.0",
-    "numpy>=1.24.0",
-    "scipy>=1.11.0",
-    "scikit-learn>=1.3.0",
-    "scikit-image>=0.21.0",
-    "matplotlib>=3.7.0",
-    "tqdm>=4.65.0",
-    "pillow>=10.0.0",
-    "tensorboard>=2.13.0",
-    "pyyaml>=6.0",
+    "torch>=2.2",
+    "torchvision>=0.17",
+    "numpy>=1.24",
+    "scikit-learn>=1.3",      # GaussianMixture for the aggregate-posterior sampler
+    "tensorboard>=2.15",      # SummaryWriter in train.py
+    "matplotlib",
+    "pandas",
+    "tqdm"
 ]
 
 [project.optional-dependencies]
-dev = [
-    "pytest>=7.4.0",
-    "pytest-cov>=4.1.0",
-    "black>=23.0",
-    "ruff>=0.1.0",
-    "mypy>=1.5.0",
+# Only needed for evaluate.py — keeps the base install lighter.
+eval = [
+    "torchmetrics>=1.3",
+    "torch-fidelity>=0.3",    # Inception weights used by torchmetrics FID
 ]
 
-[project.urls]
-Repository = "https://github.com/student/it4653-vae"
+[project.scripts]
+vae-train = "train:main"
+vae-generate = "generate:main"
+vae-evaluate = "evaluate:main"
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[dependency-groups]
+dev = [
+    "ruff>=0.6",
+]
 
-[tool.setuptools.package-dir]
-"" = "src"
+[tool.uv]
+# Flat scripts at the repo root, not an installable package layout.
+package = false
 
-[tool.black]
-line-length = 100
-target-version = ["py310"]
+# ---------------------------------------------------------------------------
+# PyTorch wheel source.
+#
+# PyPI's default torch wheel is CPU-only on some platforms and bundles a large
+# CUDA runtime on others. Pinning an explicit index makes the build reproducible.
+#
+# Pick ONE block below. Change the cu### to match your driver — check with
+# `nvidia-smi` and see https://pytorch.org/get-started/locally/ for the current
+# list of index URLs. If you are on macOS or CPU-only, delete both blocks
+# entirely: the plain PyPI wheels are correct there.
+# ---------------------------------------------------------------------------
+
+[[tool.uv.index]]
+name = "pytorch-cuda"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cuda", marker = "sys_platform == 'linux'" }]
+torchvision = [{ index = "pytorch-cuda", marker = "sys_platform == 'linux'" }]
 
 [tool.ruff]
 line-length = 100
-target-version = "py310"
-
-[tool.mypy]
-python_version = "3.10"
-warn_return_any = true
-warn_unused_configs = true
-disallow_untyped_defs = true
-ignore_missing_imports = true

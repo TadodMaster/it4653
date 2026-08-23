@@ -1,0 +1,1 @@
+uv run python cvae.py --out-dir runs --losses bce --num-workers 4 --anomaly-loss bce

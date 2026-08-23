@@ -239,3 +239,4 @@ wandb/
 # macOS / Windows
 .DS_Store
 Thumbs.db
+.claude
