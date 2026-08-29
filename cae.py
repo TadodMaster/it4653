@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 """
-Convolutional Autoencoder (AE) Experiments on MNIST / Fashion-MNIST
+Convolutional Autoencoder (AE) — Final Experiment Script for MNIST / Fashion-MNIST
 
-This script trains a Convolutional Autoencoder with various configurations
-(latent dimensions, loss functions) and evaluates it on:
+This is the consolidated "final" version of the plain (deterministic) autoencoder
+pipeline.  It trains a Convolutional Autoencoder across a sweep of configurations
+(latent dimensions × reconstruction losses) and evaluates it on:
   1. Reconstruction quality (train / test loss curves, sample grids)
-  2. Latent-space visualisation (2-D scatter, interpolation)
-  3. Anomaly detection (one-digit-removed setup, AUROC, precision–recall)
+  2. Latent-space structure (2-D scatter plot, latent interpolation strip)
+  3. Anomaly detection (one-digit-held-out setup: AUROC, average precision, recall@p95)
+
+Related scripts:
+  • cae.py  — the annotated reference AE script (same architecture)
+  • cvae.py — the probabilistic counterpart (VAE / β-VAE)
 
 Typical call:
-    python cae.py --dataset MNIST --epochs 20 --latent-dims 2 8 32 --losses bce mse
+    python Autoencoder_final.py --dataset MNIST --epochs 20 --latent-dims 2 8 32 --losses bce mse
 """
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -22,31 +27,30 @@ from pathlib import Path         # Object-oriented filesystem paths
 # ──────────────────────────────────────────────────────────────────────────────
 # Third-party imports
 # ──────────────────────────────────────────────────────────────────────────────
-import matplotlib.pyplot as plt  # Plotting library
-import numpy as np               # Numerical computing (arrays, linear algebra)
-import pandas as pd              # Tabular data handling (logs, CSV export)
+import matplotlib.pyplot as plt  # Plotting library (loss curves, scatter plots, histograms)
+import numpy as np               # Numerical computing (arrays, percentiles)
+import pandas as pd              # Tabular data handling (experiment logs, CSV export)
 
 # PyTorch: deep-learning framework for automatic differentiation & GPU acceleration
 import torch
-import torch.nn as nn            # Neural-network layers (Linear, Conv2d, BatchNorm2d, etc.)
-import torch.nn.functional as F  # Stateless functions (activations, loss functions, interpolation)
-from sklearn.metrics import average_precision_score, roc_auc_score
-from torch.utils.data import DataLoader, Subset
-torchvision = None               # placeholder (filled below)
-from torchvision import datasets, transforms   # Standard vision datasets / image pre-processing pipelines
-from torchvision.utils import save_image       # Save a grid of images in tensor form to a PNG file
+import torch.nn as nn            # Neural-network layers (Conv2d, Linear, BatchNorm2d, ...)
+import torch.nn.functional as F  # Stateless functions (activations, loss functions)
+from sklearn.metrics import average_precision_score, roc_auc_score   # Anomaly-detection metrics
+from torch.utils.data import DataLoader, Subset                      # Batching + index-based subsets
+from torchvision import datasets, transforms   # Standard vision datasets / pre-processing pipelines
+from torchvision.utils import save_image       # Save a batch of image tensors as a PNG grid
 from tqdm import tqdm            # Progress-bar wrapper for loops
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # MODEL DEFINITION: Convolutional Autoencoder
 # ═══════════════════════════════════════════════════════════════════════════════
-# An autoencoder learns to compress (encode) input data into a low-dimensional
-# latent representation z, then decompress (decode) it back to reconstruct the
-# original input.  The encoder is a stack of convolutional layers that reduce
-# spatial size while increasing channels; the decoder reverses this process using
-# transposed convolutions.  The model is trained end-to-end by minimising a
-# reconstruction loss.
+# An autoencoder learns to compress (encode) an input image into a low-dimensional
+# latent vector z, then decompress (decode) it back into a reconstruction x_hat.
+# The encoder is a stack of strided convolutions that shrink the spatial size while
+# growing the channel count; the decoder mirrors it with transposed convolutions.
+# Training is end-to-end by minimising a pixel-wise reconstruction loss — no labels
+# are used anywhere, so this is fully unsupervised representation learning.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class ConvAutoencoder(nn.Module):
@@ -55,7 +59,7 @@ class ConvAutoencoder(nn.Module):
     (e.g. MNIST, Fashion-MNIST).
 
     Architecture overview
-    -----------------------
+    ---------------------
       Input  (1, 28, 28)
         → Encoder conv blocks   : 1 → 32 → 64 channels, spatial 28 → 14 → 7
         → Flatten → FC          : 64·7·7 = 3136  →  latent_dim
@@ -70,31 +74,32 @@ class ConvAutoencoder(nn.Module):
         ----------
         latent_dim : int
             The size of the bottleneck vector z.  Smaller values force more
-            compression; larger values retain more information.
+            compression (blurrier reconstructions); larger values retain more
+            information but risk learning a near-identity mapping.
         """
         super().__init__()
         self.latent_dim = latent_dim
 
-        # ── Encoder (convolutional feature extractor) ─────────────────────
-        # Each Conv2d halves spatial dimensions (stride=2) while expanding channels.
-        # BatchNorm normalises activations per channel to speed up training.
-        # ReLU introduces non-linearity needed to learn complex mappings.
+        # ── Encoder (convolutional feature extractor) ─────────────────────────
+        # Each Conv2d with stride=2 halves the spatial resolution while expanding
+        # the channel count.  BatchNorm normalises activations per channel, which
+        # stabilises and speeds up training.  ReLU supplies the non-linearity.
         self.encoder_conv = nn.Sequential(
-            # Layer 1:  1  channel → 32 channels,  28×28 → 14×14
+            # Layer 1:  1 channel → 32 channels,  28×28 → 14×14
             nn.Conv2d(1, 32, kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm2d(32),       # Normalises each of the 32 feature maps independently
-            nn.ReLU(inplace=True),  # In-place variant saves a small amount of GPU memory
+            nn.BatchNorm2d(32),      # Normalises each of the 32 feature maps independently
+            nn.ReLU(inplace=True),   # In-place variant saves a little GPU memory
             # Layer 2:  32 channels → 64 channels,  14×14 → 7×7
             nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
         )
-        # After conv layers the tensor shape is (batch, 64, 7, 7).
-        # Flattened that is 64 * 7 * 7 = 3136 elements per image.
+        # After the conv stack the tensor shape is (batch, 64, 7, 7);
+        # flattened that is 64 * 7 * 7 = 3136 features per image.
         self.encoder_fc = nn.Linear(64 * 7 * 7, latent_dim)
 
-        # ── Decoder (transposed-convolutional upsampler) ──────────────────
-        # mirror image of the encoder: latent vector → FC → reshape → deconv
+        # ── Decoder (transposed-convolutional upsampler) ──────────────────────
+        # Mirror image of the encoder: latent vector → FC → reshape → deconv stack.
         self.decoder_fc = nn.Linear(latent_dim, 64 * 7 * 7)
         self.decoder_conv = nn.Sequential(
             # Layer 1: 64 channels → 32 channels,  7×7 → 14×14
@@ -103,10 +108,10 @@ class ConvAutoencoder(nn.Module):
             nn.ReLU(inplace=True),
             # Layer 2: 32 channels → 1 channel,  14×14 → 28×28
             nn.ConvTranspose2d(32, 1, kernel_size=4, stride=2, padding=1),
-            nn.Sigmoid(),            # Squeezes every pixel to the range [0, 1]
+            nn.Sigmoid(),            # Squeezes every pixel into [0, 1], matching ToTensor()
         )
 
-    # ── Forward helpers (encode / decode / full forward) ────────────────
+    # ── Forward helpers (encode / decode / full forward) ──────────────────────
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -115,15 +120,15 @@ class ConvAutoencoder(nn.Module):
         Parameters
         ----------
         x : torch.Tensor
-            Image batch of shape (batch_size, 1, 28, 28), pixel values in [0, 1].
+            Image batch of shape (B, 1, 28, 28), pixel values in [0, 1].
 
         Returns
         -------
         z : torch.Tensor
-            Latent codes of shape (batch_size, latent_dim).
+            Latent codes of shape (B, latent_dim).
         """
         h = self.encoder_conv(x)     # → (B, 64, 7, 7)
-        h = h.flatten(start_dim=1)   # collapse all dims after batch: (B, 64*7*7)
+        h = h.flatten(start_dim=1)   # collapse everything after the batch dim: (B, 3136)
         return self.encoder_fc(h)    # → (B, latent_dim)
 
     def decode(self, z: torch.Tensor) -> torch.Tensor:
@@ -133,16 +138,16 @@ class ConvAutoencoder(nn.Module):
         Parameters
         ----------
         z : torch.Tensor
-            Latent codes of shape (batch_size, latent_dim).
+            Latent codes of shape (B, latent_dim).
 
         Returns
         -------
         x_hat : torch.Tensor
-            Reconstructed images of shape (batch_size, 1, 28, 28).
+            Reconstructed images of shape (B, 1, 28, 28), values in [0, 1].
         """
-        h = self.decoder_fc(z)                   # → (B, 64*7*7)
-        h = h.view(z.size(0), 64, 7, 7)         # reshape back to feature-map form
-        return self.decoder_conv(h)              # → (B, 1, 28, 28)
+        h = self.decoder_fc(z)               # → (B, 3136)
+        h = h.view(z.size(0), 64, 7, 7)      # reshape back into feature-map form
+        return self.decoder_conv(h)          # → (B, 1, 28, 28)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -151,7 +156,7 @@ class ConvAutoencoder(nn.Module):
         Returns
         -------
         x_hat : reconstructed image tensor, shape (B, 1, 28, 28)
-        z     : latent code tensor,          shape (B, latent_dim)
+        z     : latent code tensor,         shape (B, latent_dim)
         """
         z = self.encode(x)
         x_hat = self.decode(z)
@@ -164,21 +169,20 @@ class ConvAutoencoder(nn.Module):
 
 def set_seed(seed: int) -> None:
     """
-    Fix every random-number generator that the pipeline touches so that
-    runs with the same seed produce identical weights, losses, and plots.
+    Fix every random-number generator that the pipeline touches so that runs with
+    the same seed produce identical weights, losses, and plots.
 
-    This is crucial for fair comparison: if you change one hyper-parameter
-    (e.g. latent_dim) you want the only difference in the result to come from
-    that change, not from different random initialisations or data shuffling.
+    This matters for a fair sweep: when only `latent_dim` changes, we want the
+    observed difference to come from that change alone — not from a different
+    weight initialisation or a different shuffling order.
     """
-    random.seed(seed)                # Python built-in random module
-    np.random.seed(seed)             # NumPy random module
-    torch.manual_seed(seed)          # PyTorch CPU RNG
+    random.seed(seed)                     # Python built-in random module
+    np.random.seed(seed)                  # NumPy RNG
+    torch.manual_seed(seed)               # PyTorch CPU RNG
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)  # PyTorch GPU RNG (all devices)
-    # CuDNN is a highly-optimised CUDA backend for convolutions.  It uses
-    # non-deterministic algorithms by default for speed.  These flags force
-    # deterministic algorithms at the cost of a small performance penalty.
+    # CuDNN picks non-deterministic convolution algorithms by default for speed.
+    # These two flags force deterministic kernels at a small performance cost.
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
 
@@ -198,9 +202,9 @@ def get_device() -> torch.device:
 # ═══════════════════════════════════════════════════════════════════════════════
 # DATA LOADING HELPERS
 # ═══════════════════════════════════════════════════════════════════════════════
-# The torchvision.datasets module already standardises MNIST / Fashion-MNIST:
-# images are 28×28 grayscale PIL images and labels are integers 0-9.
-# We only need to add a transform that converts PIL → normalised FloatTensor.
+# torchvision.datasets already standardises MNIST / Fashion-MNIST: images are
+# 28×28 grayscale PIL images and labels are integers 0-9.  All we add is a
+# transform that converts PIL → normalised FloatTensor.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def get_dataset(name: str, root: Path, train: bool):
@@ -212,7 +216,7 @@ def get_dataset(name: str, root: Path, train: bool):
     name : str
         Must be "MNIST" or "FashionMNIST".
     root : Path
-        Local directory where raw data (binary idx files) will be cached.
+        Local directory where the raw idx files are cached.
     train : bool
         True → the 60 000-image training split.
         False → the 10 000-image test split.
@@ -221,8 +225,8 @@ def get_dataset(name: str, root: Path, train: bool):
     -------
     torchvision.datasets.VisionDataset
     """
-    # transforms.ToTensor() converts a PIL Image (H×W in [0,255]) into a
-    # torch.FloatTensor (C×H×W in [0,1]).  For MNIST C=1 (grayscale).
+    # ToTensor() converts a PIL Image (H×W, uint8 in [0,255]) into a
+    # torch.FloatTensor (C×H×W in [0,1]).  For MNIST C = 1 (grayscale).
     transform = transforms.Compose([transforms.ToTensor()])
     if name == "MNIST":
         return datasets.MNIST(root=root, train=train, download=True, transform=transform)
@@ -240,7 +244,7 @@ def make_loader(
     device: torch.device,
 ) -> DataLoader:
     """
-    Wrap a dataset in a PyTorch DataLoader with a seeded random sampler.
+    Wrap a dataset in a PyTorch DataLoader with its own seeded random sampler.
 
     Parameters
     ----------
@@ -248,17 +252,17 @@ def make_loader(
     batch_size : int
         How many samples per SGD step.
     shuffle : bool
-        Whether to reshuffle the data at every epoch.  Typically True for
-        training, False for testing (to keep evaluation deterministic).
+        Reshuffle every epoch.  Typically True for training, False for testing
+        (so evaluation order — and hence the visualised batch — is deterministic).
     seed : int
-        The DataLoader needs its own torch.Generator so shuffling does not
-        interfere with the global PyTorch RNG.
+        The DataLoader gets its own torch.Generator so that shuffling does not
+        consume draws from (and therefore perturb) the global PyTorch RNG.
     num_workers : int
         Number of CPU sub-processes used to load and pre-process batches.
-        0 means the main process does everything (slower but easier to debug).
+        0 means the main process does everything (slower, but easier to debug).
     device : torch.device
-        When on CUDA, pin_memory=True causes the DataLoader to keep page-locked
-        ("pinned") CPU memory, which accelerates asynchronous CPU→GPU copies.
+        On CUDA, pin_memory=True keeps page-locked ("pinned") host memory, which
+        makes asynchronous CPU→GPU copies substantially faster.
 
     Returns
     -------
@@ -278,9 +282,10 @@ def make_loader(
 
 def limit_batches(loader, max_batches: int | None):
     """
-    Wrapper that caps a DataLoader at `max_batches` batches.
-    Very useful for fast smoke-tests: set --max-train-batches 2 to verify the
-    pipeline does not crash before launching a full multi-hour run.
+    Generator that caps a DataLoader at `max_batches` batches (None = no cap).
+
+    Very useful for fast smoke-tests: pass --max-train-batches 2 to confirm the
+    whole pipeline runs end-to-end before launching a full multi-hour sweep.
     """
     for batch_id, batch in enumerate(loader):
         if max_batches is not None and batch_id >= max_batches:
@@ -291,45 +296,50 @@ def limit_batches(loader, max_batches: int | None):
 # ═══════════════════════════════════════════════════════════════════════════════
 # LOSS FUNCTION
 # ═══════════════════════════════════════════════════════════════════════════════
-# The job of the loss is to measure how different the reconstruction x_hat is
-# from the original image x.  Lower loss ⇒ the AE has learned to compress the
-# important information and discard noise.
+# The loss measures how different the reconstruction x_hat is from the original
+# image x.  A lower loss means the AE has learned to squeeze the important
+# information through the bottleneck and discard the rest.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def ae_loss(x_hat: torch.Tensor, x: torch.Tensor, loss_name: str) -> torch.Tensor:
     """
-    Pixel-wise reconstruction loss, averaged per image then averaged over the batch.
+    Pixel-wise reconstruction loss: summed per image, then averaged over the batch.
 
-    Why `reduction="sum"` per image?
-    -----------------------------
-    Using `mean` would divide by the total number of pixels (28·28 = 784).
-    If we later compare different image sizes, losses would not be comparable.
-    Summing per image and dividing by the batch size keeps the loss scale
-    independent of the image resolution.
+    Why `reduction="sum"` then divide by the batch size?
+    ---------------------------------------------------
+    `reduction="mean"` would also divide by the pixel count (28·28 = 784), making
+    the reported number depend on the image resolution.  Summing per image and
+    dividing only by the batch size keeps the loss scale resolution-independent,
+    so numbers stay comparable across datasets and against the VAE script.
 
     Parameters
     ----------
     x_hat, x : torch.Tensor
-        Tensors of shape (B, 1, 28, 28) in the range [0, 1].
-        x_hat is the model output (after Sigmoid), x is the ground-truth image.
+        Tensors of shape (B, 1, 28, 28) with values in [0, 1].
+        x_hat is the model output (post-Sigmoid); x is the ground-truth image.
     loss_name : {"bce", "mse"}
-        "bce"  — Binary Cross-Entropy: good when pixels are treated as independent
-                 Bernoulli probabilities.  Penalises confident but wrong pixels heavily.
-        "mse"  — Mean-Squared Error:   treats reconstruction as regression.
-                 Penalises large pixel errors quadratically.
+        "bce"  — Binary Cross-Entropy: treats each pixel as an independent
+                 Bernoulli probability; punishes confident-but-wrong pixels hard.
+        "mse"  — Mean-Squared Error: treats reconstruction as regression;
+                 punishes large pixel errors quadratically (tends to blur).
 
     Returns
     -------
     torch.Tensor
-        Scalar tensor holding the average reconstruction loss per image in the batch.
+        Scalar: average reconstruction loss per image in the batch.
     """
+    # Sum over pixels per image, then average over the batch for a stable scale.
     if loss_name == "bce":
-        # Since the decoder ends with Sigmoid, x_hat is already in [0, 1],
-        # matching the ground-truth range of ToTensor().
+        # The decoder ends with Sigmoid, so x_hat already lies in [0, 1] —
+        # exactly the range BCE requires and the range ToTensor() produces.
         return F.binary_cross_entropy(x_hat, x, reduction="sum") / x.size(0)
     if loss_name == "mse":
-        # MSE works well even without a Sigmoid, but here we keep it consistent.
+        # MSE would work without the Sigmoid too, but we keep the decoder identical
+        # across losses so the only variable in the comparison is the objective.
         return F.mse_loss(x_hat, x, reduction="sum") / x.size(0)
+    # Placeholder for a third objective (L1 / MAE); not wired into --losses yet.
+    # if loss_name == "L1":
+    #     return F.L1
     raise ValueError(f"Unsupported AE loss: {loss_name}")
 
 
@@ -341,14 +351,14 @@ def train_one_epoch(model, loader, optimizer, device, loss_name: str, max_batche
     """
     Run one complete pass (one epoch) over the training data.
 
-    The loop:
-      1. Fetch a mini-batch (x, y) from the DataLoader.
-      2. Move x to GPU.
-      3. Zero existing gradients.
-      4. Forward pass → get reconstruction x_hat.
-      5. Compute loss between x_hat and original x.
-      6. Backward pass ( computes ∂loss/∂parameters ).
-      7. Optimiser step (Adam updates weights).
+    The loop per mini-batch:
+      1. Fetch (x, y) from the DataLoader — labels are ignored (unsupervised).
+      2. Move x to the compute device.
+      3. Clear stale gradients.
+      4. Forward pass → reconstruction x_hat.
+      5. Compute the reconstruction loss against the original x.
+      6. Backward pass (autograd computes ∂loss/∂parameters).
+      7. Optimiser step (Adam updates the weights).
 
     Parameters
     ----------
@@ -361,51 +371,51 @@ def train_one_epoch(model, loader, optimizer, device, loss_name: str, max_batche
     device : torch.device
         Target compute device.
     loss_name : str
-        Passed to ae_loss().
+        Passed straight through to ae_loss().
     max_batches : int | None
-        For debugging: stop after this many batches.
+        For debugging: stop the epoch after this many batches.
 
     Returns
     -------
     float
-        Average reconstruction loss per image over the epoch.
+        Average reconstruction loss per image over the whole epoch.
     """
-    model.train()                    # Training mode: BatchNorm uses running stats, enables dropout
-    running = 0.0                    # Accumulate total loss × samples (numerically more stable than averaging iteratively)
-    seen = 0                         # Total number of images processed this epoch
+    model.train()          # Train mode: BatchNorm updates its running statistics
+    running = 0.0          # Accumulates (batch loss × batch size) = total loss
+    seen = 0               # Total number of images processed this epoch
 
-    # tqdm adds a nice progress bar with estimated time remaining.
+    # tqdm wraps the iterator with a progress bar and an ETA estimate.
     for x, _ in tqdm(limit_batches(loader, max_batches), desc="train", leave=False):
-        x = x.to(device)             # Non-blocking copy when pin_memory=True and CUDA is used.
+        x = x.to(device)   # Host → device copy (fast path when pin_memory is on)
 
-        # `set_to_none=True` is faster than zero_grad() because it does not write
-        # zeros into existing gradient buffers; it replaces them with None.
+        # `set_to_none=True` is faster than writing zeros into the existing
+        # gradient buffers — it simply drops the references.
         optimizer.zero_grad(set_to_none=True)
-        x_hat, _ = model(x)                       # Forward: image → latent → reconstructed image
+        x_hat, _ = model(x)                       # Forward: image → latent → reconstruction
         loss = ae_loss(x_hat, x, loss_name)       # How bad is the reconstruction?
-        loss.backward()                           # Autograd: compute all parameter gradients
-        optimizer.step()                            # Update weights via Adam
+        loss.backward()                           # Autograd: all parameter gradients
+        optimizer.step()                          # Adam updates the weights
 
-        # We multiply by batch size because `reduction="sum"` already made `loss`
-        # the *average* loss.  Multiplying brings it back to the total loss of this
-        # batch, so we can average correctly across variable-sized last batches.
+        # `loss` is already the *average per image*, so multiplying by the batch
+        # size recovers this batch's total.  This keeps the epoch average correct
+        # even when the final batch is smaller than batch_size.
         running += loss.item() * x.size(0)
         seen += x.size(0)
 
-    # Guard against division by zero on an empty loader.
+    # max(seen, 1) guards against a division by zero on an empty loader.
     return running / max(seen, 1)
 
 
-@torch.no_grad()                     # Decorator disables gradient tracking for the ENTIRE function.
+@torch.no_grad()          # Decorator disables gradient tracking for the WHOLE function
 def evaluate(model, loader, device, loss_name: str, max_batches=None) -> float:
     """
     Run one evaluation pass and return the average reconstruction loss.
 
-    Identical to train_one_epoch except there is no back-propagation or optimiser
-    step.  `@torch.no_grad()` is critical here because it halves memory usage
-    and doubles throughput by skipping the autograd bookkeeping entirely.
+    Identical to train_one_epoch except that there is no backward pass and no
+    optimiser step.  `@torch.no_grad()` matters here: skipping the autograd graph
+    roughly halves memory use and noticeably increases throughput.
     """
-    model.eval()                     # Evaluation mode: BatchNorm uses running means/vars (no update)
+    model.eval()           # Eval mode: BatchNorm uses its stored running mean/var
     running = 0.0
     seen = 0
     for x, _ in limit_batches(loader, max_batches):
@@ -420,67 +430,75 @@ def evaluate(model, loader, device, loss_name: str, max_batches=None) -> float:
 # ═══════════════════════════════════════════════════════════════════════════════
 # VISUALISATION HELPERS
 # ═══════════════════════════════════════════════════════════════════════════════
-# These functions save static PNG images that let you inspect what the model
-# has learned without running a notebook server.
+# These functions write static PNG files so you can inspect what the model
+# learned without needing a notebook server.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
 def save_reconstruction_grid(model, loader, device, path: Path, n: int = 16) -> None:
     """
-    Save a PNG grid comparing original images to their reconstructions.
+    Save a PNG grid comparing original images against their reconstructions.
 
     Layout
     ------
-    The output file shows n sample pairs interleaved:
+    The output file interleaves n sample pairs:
         [orig_0, recon_0, orig_1, recon_1, ...]
-    arranged in rows of 8 images.
-    A separate file `*_original.png` contains just the originals.
+    laid out in rows of 8 images.  A sibling file `*_original.png` holds just the
+    originals, which is handy for side-by-side figures in a report.
 
     Parameters
     ----------
     model : ConvAutoencoder
     loader : DataLoader
-        Typically the test loader (unseen data shows generalisation).
+        Typically the test loader — reconstructions of unseen data show
+        generalisation rather than memorisation.
     device : torch.device
     path : Path
-        Destination PNG path.  A sibling file `_original.png` is auto-created.
+        Destination PNG path.  `<stem>_original<suffix>` is auto-created next to it.
     n : int
-        Number of images to visualise (must be divisible by `nrow` for aesthetics).
+        Number of images to visualise (a multiple of nrow=8 looks tidiest).
     """
     model.eval()
-    x, _ = next(iter(loader))        # Grab the very first batch from the loader
-    x = x[:n].to(device)             # Keep only the first n samples
+    x, _ = next(iter(loader))    # Grab the very first batch from the loader
+    x = x[:n].to(device)         # Keep only the first n samples
 
-    # Save a reference grid of the original images
+    # Save the reference grid of untouched originals.
     original_path = path.parent / f"{path.stem}_original{path.suffix}"
-    save_image(x.cpu(), original_path, nrow=8, padding=2, normalize=False)
+    save_image(
+        x.cpu(),
+        original_path,
+        nrow=8,
+        padding=2
+    )
 
-    x_hat, _ = model(x)              # Run through the full AE
+    x_hat, _ = model(x)          # Run the batch through the full autoencoder
 
-    # Interleave original and reconstruction so they appear side-by-side in pairs
-    # Result tensor shape: (2*n, 1, 28, 28)
+    # Interleave originals and reconstructions so each pair sits side-by-side.
+    # Resulting tensor shape: (2*n, 1, 28, 28).
     pair_rows = torch.empty((2 * n, 1, 28, 28), device=device)
-    pair_rows[0::2] = x             # even indices = originals
-    pair_rows[1::2] = x_hat         # odd indices  = reconstructions
+    pair_rows[0::2] = x          # even indices = originals
+    pair_rows[1::2] = x_hat      # odd indices  = reconstructions
     save_image(pair_rows.cpu(), path, nrow=8, padding=2)
 
 
 @torch.no_grad()
 def plot_latent_2d(model, loader, device, path: Path, max_points: int = 5000) -> None:
     """
-    Encode test images and scatter-plot their 2-D latent codes, colour-coded by
-    ground-truth label.  Only makes real sense when latent_dim == 2, but the
-    function blindly plots the first two dimensions otherwise.
+    Encode test images and scatter-plot their 2-D latent codes, coloured by the
+    ground-truth label.  This is only truly meaningful when latent_dim == 2; for
+    larger bottlenecks the function would just plot the first two coordinates,
+    which carry no special meaning.
 
     Why visualise the latent space?
-    ---------------------------------------------------------------
-    A well-trained AE should cluster the latent codes of the same class together.
-    If classes overlap heavily, the bottleneck is either too small or the AE
-    has not learned discriminative features.
+    ------------------------------
+    A well-trained AE tends to place samples of the same class near each other.
+    Heavy overlap between colours means either the bottleneck is too tight or the
+    model has not learned discriminative features.  Note the labels are used
+    *only* for colouring — training itself never sees them.
     """
     model.eval()
-    zs = []      # Collector for latent numpy arrays
-    ys = []      # Collector for label arrays
+    zs = []      # Collected latent arrays, one per batch
+    ys = []      # Collected label arrays, one per batch
     count = 0
 
     for x, y in loader:
@@ -489,14 +507,14 @@ def plot_latent_2d(model, loader, device, path: Path, max_points: int = 5000) ->
         zs.append(z)
         ys.append(y.numpy())
         count += x.size(0)
-        if count >= max_points:            # Cap to keep plotting fast
+        if count >= max_points:             # Cap the point count to keep plotting fast
             break
 
-    # Concatenate across batches and slice to the cap
+    # Concatenate across batches, then trim to exactly max_points.
     z_all = np.concatenate(zs, axis=0)[:max_points]
     y_all = np.concatenate(ys, axis=0)[:max_points]
 
-    # tab10 is a 10-colour map: perfect for the 10 MNIST classes
+    # "tab10" is a 10-colour qualitative colormap — one colour per MNIST class.
     plt.figure(figsize=(7, 6))
     scatter = plt.scatter(z_all[:, 0], z_all[:, 1], c=y_all, s=7, cmap="tab10", alpha=0.8)
     plt.colorbar(scatter, ticks=list(range(10)))
@@ -511,35 +529,35 @@ def plot_latent_2d(model, loader, device, path: Path, max_points: int = 5000) ->
 @torch.no_grad()
 def save_interpolation(model, dataset, device, path: Path, steps: int = 11) -> None:
     """
-    Linearly interpolate between the latent codes of two images from
-    **different** classes and decode each intermediate point.
+    Linearly interpolate between the latent codes of two images from **different**
+    classes and decode every intermediate point.
 
     Why interpolate?
     ----------------
-    A smooth, meaningful latent manifold implies that walking a straight line
-    between two latent points produces a gradual visual morph.  Sudden jumps
-    or meaningless intermediate images indicate a fragmented latent space.
+    A smooth, well-organised latent manifold means that walking a straight line
+    between two latent points produces a gradual visual morph.  Abrupt jumps or
+    meaningless intermediate frames indicate a fragmented latent space — a known
+    weakness of the plain AE relative to a VAE, whose KL term explicitly
+    regularises the latent space toward a smooth prior.
 
     Parameters
     ----------
     model : ConvAutoencoder
     dataset : torch.utils.data.Dataset
-        Usually the test dataset for generalisation.
+        Usually the test dataset, so the endpoints are unseen samples.
     device : torch.device
     path : Path
         PNG save path.  The output is a single row of `steps` images.
     steps : int
-        Number of evenly-spaced points along the interpolation line, including
-        both endpoints.
+        Number of evenly spaced points along the line, endpoints included.
     """
     model.eval()
 
-    # Pick the very first sample
+    # Endpoint A: simply the first sample in the dataset.
     first_x, first_y = dataset[0]
 
-    # Scan forward until we find a sample from a DIFFERENT class.
-    # This guarantees a visually interesting transition, not an interpolation
-    # between two variants of the same digit.
+    # Endpoint B: scan forward until we hit a sample from a DIFFERENT class, so the
+    # transition is visually interesting rather than two variants of one digit.
     second_x = None
     for x, y in dataset:
         if y != first_y:
@@ -548,17 +566,18 @@ def save_interpolation(model, dataset, device, path: Path, steps: int = 11) -> N
     if second_x is None:
         raise RuntimeError("Could not find two samples with different labels for interpolation.")
 
-    # Add batch dimension: (1, 1, 28, 28) and move to compute device
+    # Add a batch dimension: (1, 1, 28, 28), and move onto the compute device.
     xa = first_x.unsqueeze(0).to(device)
     xb = second_x.unsqueeze(0).to(device)
 
     za = model.encode(xa)   # (1, latent_dim)
-    zb = model.encode(xb)
+    zb = model.encode(xb)   # (1, latent_dim)
 
-    # Create `steps` evenly-spaced scalars α ∈ [0, 1]
-    # z_interp(α) = (1-α)·za + α·zb   (linear interpolation in Euclidean space)
+    # `steps` evenly spaced blend factors α ∈ [0, 1], shaped (steps, 1) so they
+    # broadcast across the latent dimension:
+    #     z(α) = (1 − α)·za + α·zb      (straight-line interpolation)
     alphas = torch.linspace(0, 1, steps, device=device).view(-1, 1)   # (steps, 1)
-    z = (1 - alphas) * za + alphas * zb                                # (steps, latent_dim)
+    z = (1 - alphas) * za + alphas * zb                               # (steps, latent_dim)
 
     decoded = model.decode(z)          # (steps, 1, 28, 28)
     save_image(decoded.cpu(), path, nrow=steps, padding=2)
@@ -570,95 +589,93 @@ def save_interpolation(model, dataset, device, path: Path, steps: int = 11) -> N
 
 def train_ae_for_latent_dim(args, latent_dim: int, loss_name: str, train_loader, test_loader, run_dir: Path, device):
     """
-    Train ONE autoencoder configuration (a specific latent_dim and loss_name).
+    Train ONE autoencoder configuration (a specific latent_dim × loss_name pair).
 
-    The function is called in a nested loop in `main()` so that every
-    (loss_name × latent_dim) combination is trained, evaluated, and its
-    artefacts saved independently.
+    `main()` calls this in a nested loop so every combination is trained,
+    evaluated, and has its artefacts saved independently of the others.
 
     Returns
     -------
     model : ConvAutoencoder
-        The trained model (useful for further downstream tasks).
+        The trained model (returned in case a caller wants further analysis).
     rows : list[dict]
-        One dictionary per epoch, ready to be concatenated into a DataFrame.
+        One dictionary per epoch, ready to be turned into a DataFrame.
     """
-    # Fresh model for every configuration (do not reuse previous weights)
+    # A fresh model per configuration — never reuse the previous run's weights.
     model = ConvAutoencoder(latent_dim).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-
     rows = []
     for epoch in range(1, args.epochs + 1):
         train_loss = train_one_epoch(model, train_loader, optimizer, device, loss_name, args.max_train_batches)
-        test_loss  = evaluate(model, test_loader, device, loss_name, args.max_test_batches)
+        test_loss = evaluate(model, test_loader, device, loss_name, args.max_test_batches)
 
-        # Log epoch-level metrics.  The "model" and "dataset" columns make this
-        # CSV self-describing if you later concatenate logs from many experiments.
+        # Log epoch-level metrics.  Carrying "model" and "dataset" in every row
+        # makes the CSV self-describing when logs from several runs are merged.
         row = {
             "model": "AE",
             "dataset": args.dataset,
             "loss_name": loss_name,
             "latent_dim": latent_dim,
             "epoch": epoch,
-            "train_recon_loss": train_loss,   # average loss on the training set
-            "test_recon_loss": test_loss,    # average loss on the held-out test set
+            "train_recon_loss": train_loss,   # average loss on the training split
+            "test_recon_loss": test_loss,     # average loss on the held-out test split
             "seed": args.seed,
         }
         rows.append(row)
-        print(row)                         # Print to stdout so the user sees live progress
+        print(row)                            # Live progress on stdout
 
-    # ── Save configuration-specific artefacts ──
+    # ── Save this configuration's artefacts ──────────────────────────────────
 
-    # 1. Model checkpoint.  We save only the state_dict (weights + buffers),
-    # not the full model object, because state_dicts are smaller and do not
-    # couple to the exact Python / PyTorch versions.
+    # 1. Model checkpoint.  We store only the state_dict (weights + buffers)
+    #    rather than the pickled model object: it is smaller and does not couple
+    #    the file to the exact Python / PyTorch version used here.
     torch.save(model.state_dict(), run_dir / f"ae_{loss_name}_latent_{latent_dim}.pt")
 
     # 2. Visual grid of reconstructions vs. originals.
     save_reconstruction_grid(model, test_loader, device, run_dir / f"recon_{loss_name}_latent_{latent_dim}.png")
 
-    # 3. 2-D latent visualisation and interpolation are meaningful ONLY when
-    #    the bottleneck is exactly 2-D.  For higher dimensions the scatter plot
-    #    would just show the first two arbitrary coordinates, which is misleading.
+    # 3. The 2-D scatter and the interpolation strip are only meaningful when the
+    #    bottleneck is exactly 2-D; for higher dims a scatter of the first two
+    #    arbitrary coordinates would be misleading.
     if latent_dim == 2:
         plot_latent_2d(model, test_loader, device, run_dir / f"latent_map_2d_{loss_name}.png")
         save_interpolation(model, test_loader.dataset, device, run_dir / f"interpolation_ae_{loss_name}.png")
-
     return model, rows
 
 
 def save_loss_comparison(all_rows: list[dict], run_dir: Path) -> None:
     """
     After every configuration has been trained, build:
-      1. A summary CSV with the *final-epoch* test loss for each (loss, latent_dim) pair.
-      2. A plot with one subplot per loss function, showing how test reconstruction
-         error changes as the bottleneck size grows.
+      1. A summary CSV holding the *final-epoch* test loss of each
+         (loss_name, latent_dim) pair.
+      2. A figure with one subplot per loss function, showing how the test
+         reconstruction error changes as the bottleneck grows.
 
-    The plot uses a log₂ x-axis because the default latent_dims are powers of two
-    (2, 8, 32, 128), making the spacing linear in a log scale.
+    The x-axis uses a log₂ scale because the default latent_dims are powers of
+    two (2, 8, 32, 128), which then space out evenly.
     """
     df = pd.DataFrame(all_rows)
-    # Group by unique (loss_name, latent_dim) configurations and keep only the LAST
-    # epoch of each group (the fully converged model).
+    # Group by unique (loss_name, latent_dim) and keep only the LAST epoch of each
+    # group — i.e. the fully-trained model rather than an intermediate checkpoint.
     final_df = df.sort_values("epoch").groupby(["loss_name", "latent_dim"], as_index=False).tail(1)
     final_df = final_df.sort_values(["loss_name", "latent_dim"])
     final_df.to_csv(run_dir / "loss_comparison_summary.csv", index=False)
 
     loss_names = final_df["loss_name"].unique().tolist()
     # One subplot per loss function, arranged horizontally.
+    # squeeze=False guarantees `axes` stays 2-D even for a single loss function.
     fig, axes = plt.subplots(1, len(loss_names), figsize=(6 * len(loss_names), 4), squeeze=False)
-
     for ax, loss_name in zip(axes[0], loss_names):
         loss_df = final_df[final_df["loss_name"] == loss_name]
         ax.plot(loss_df["latent_dim"], loss_df["test_recon_loss"], marker="o")
-        ax.set_xscale("log", base=2)                     # Logarithmic scale in base 2
+        ax.set_xscale("log", base=2)                     # Logarithmic x-axis, base 2
+        # Force ticks at exactly the sampled latent dims (not log-scale defaults).
         ax.set_xticks(loss_df["latent_dim"].tolist())
         ax.set_xticklabels([str(v) for v in loss_df["latent_dim"].tolist()])
         ax.set_xlabel("latent dim")
         ax.set_ylabel(f"test reconstruction {loss_name.upper()}")
         ax.set_title(f"AE trained with {loss_name.upper()}")
         ax.grid(True, alpha=0.3)
-
     fig.tight_layout()
     fig.savefig(run_dir / "loss_comparison_by_latent_dim.png", dpi=160)
     plt.close(fig)
@@ -667,21 +684,22 @@ def save_loss_comparison(all_rows: list[dict], run_dir: Path) -> None:
 # ═══════════════════════════════════════════════════════════════════════════════
 # ANOMALY-DETECTION EXPERIMENT
 # ═══════════════════════════════════════════════════════════════════════════════
-# Core idea: an AE learns to faithfully reconstruct the data distribution it was
-# trained on.  If we withhold one digit class during training, that class
-# becomes an "anomaly" at test time.  Because the AE has never seen that class,
-# its reconstructions will be poor → high reconstruction error.
+# Core idea: an AE only learns to faithfully reconstruct the distribution it was
+# trained on.  If we withhold one digit class during training, that class becomes
+# an "anomaly" at test time — the model has never seen it, so its reconstruction
+# will be poor and its reconstruction error high.
 #
-# Thus reconstruction error acts as an anomaly SCORE: high score = likely anomaly.
-# We threshold this score and compute standard classification metrics (AUROC, AP).
+# Reconstruction error therefore acts as an anomaly SCORE (higher = more anomalous).
+# We rank test samples by that score and compute standard detection metrics
+# (AUROC, average precision) plus one operational metric at a fixed threshold.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def subset_without_digit(dataset, excluded_digit: int) -> Subset:
     """
     Return a Subset containing every sample whose label is NOT `excluded_digit`.
 
-    This becomes the "normal" training data: the AE learns the distribution of
-    the other 9 digits and will struggle to reconstruct the excluded one.
+    This is the "normal" training data: the AE learns the distribution of the
+    remaining nine digits and will struggle to reconstruct the excluded one.
     """
     indices = []
     for idx, (_, y) in enumerate(dataset):
@@ -693,10 +711,12 @@ def subset_without_digit(dataset, excluded_digit: int) -> Subset:
 @torch.no_grad()
 def reconstruction_errors(model, loader, device, max_batches=None):
     """
-    Compute reconstruction BCE for every image in the loader.
+    Compute the reconstruction BCE for every image in the loader.
 
-    We compute the per-image SUM of pixel-wise BCE (not mean).  This sum is the
-    anomaly score: larger values indicate worse reconstruction quality.
+    We take the per-image SUM of the pixel-wise BCE (not the mean); that sum is
+    the anomaly score, with larger values meaning worse reconstruction.  BCE is
+    used here regardless of the training loss so that scores stay comparable
+    across runs.
 
     Returns
     -------
@@ -711,7 +731,8 @@ def reconstruction_errors(model, loader, device, max_batches=None):
     for x, y in limit_batches(loader, max_batches):
         x = x.to(device)
         x_hat, _ = model(x)
-        # reduction="none" gives per-pixel losses; flatten then sum over all pixels
+        # reduction="none" keeps the per-pixel losses; flatten(1) merges the
+        # channel/height/width dims so sum(dim=1) totals each image separately.
         err = F.binary_cross_entropy(x_hat, x, reduction="none").flatten(1).sum(dim=1)
         errors.extend(err.cpu().numpy().tolist())
         labels.extend(y.numpy().tolist())
@@ -720,27 +741,29 @@ def reconstruction_errors(model, loader, device, max_batches=None):
 
 def run_anomaly_experiment(args, train_dataset, test_dataset, run_dir: Path, device):
     """
-    Run the one-class anomaly-detection experiment in a loop over
+    Run the one-class anomaly-detection experiment, looping over
     `args.anomaly_digits`.  For each digit:
 
-      1. Remove it from the training set.
-      2. Train a fresh AE on the remaining 9 digits.
-      3. Score every test image by its reconstruction error on this AE.
+      1. Remove that digit from the training set.
+      2. Train a fresh AE on the remaining nine digits.
+      3. Score every test image by its reconstruction error under that AE.
       4. Compute:
-            AUROC              – area under the ROC curve (threshold-agnostic)
-            Average Precision  – area under the precision-recall curve (good for
-                                 imbalanced classes since we have 9 normal vs. 1 anomaly)
-            recall_at_95      – what fraction of true anomalies are caught when the
-                                 threshold is set at the 95th percentile of normal scores?
-      5. Plot and save the score distributions with the decision threshold.
+            AUROC             – area under the ROC curve (threshold-agnostic ranking quality)
+            Average Precision – area under the precision–recall curve, the more
+                                informative metric here because the classes are
+                                imbalanced (≈9 normal digits vs. 1 anomalous)
+            recall_at_95      – what fraction of true anomalies is caught when the
+                                threshold sits at the 95th percentile of normal
+                                scores (i.e. at a fixed 5 % false-positive rate)
+      5. Plot and save the two score distributions with the decision threshold.
 
     Parameters
     ----------
     args : argparse.Namespace
-        Parsed CLI flags (contains anomaly hyper-parameters).
+        Parsed CLI flags (contains the anomaly hyper-parameters).
     train_dataset, test_dataset : torchvision.datasets.*
     run_dir : Path
-        Output directory for PNG plots and CSV log.
+        Output directory for the PNG plots and the CSV log.
     device : torch.device
 
     Returns
@@ -749,33 +772,33 @@ def run_anomaly_experiment(args, train_dataset, test_dataset, run_dir: Path, dev
         Summary rows, one per excluded digit.
     """
     anomaly_rows = []
-
     for excluded_digit in args.anomaly_digits:
-        # ── Step 1: Build the "normal" training set ──
+        # ── Step 1: build the "normal" training set (and the full test loader) ──
+        # The test set intentionally keeps ALL ten digits: nine normal classes plus
+        # the excluded one, which supplies the positive (anomalous) examples.
         normal_train = subset_without_digit(train_dataset, excluded_digit)
-        train_loader = make_loader(normal_train, args.batch_size, True,  args.seed, args.num_workers, device)
-        test_loader  = make_loader(test_dataset,   args.batch_size, False, args.seed, args.num_workers, device)
+        train_loader = make_loader(normal_train, args.batch_size, True, args.seed, args.num_workers, device)
+        test_loader = make_loader(test_dataset, args.batch_size, False, args.seed, args.num_workers, device)
 
-        # ── Step 2: Train a fresh AE only on the 9 normal digits ──
+        # ── Step 2: train a fresh AE on the nine normal digits only ──
         model = ConvAutoencoder(args.anomaly_latent_dim).to(device)
         optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
         for _ in range(args.anomaly_epochs):
             train_one_epoch(model, train_loader, optimizer, device, args.anomaly_loss, args.max_train_batches)
 
-        # ── Step 3: Score every test image ──
+        # ── Step 3: score every test image ──
         errors, labels = reconstruction_errors(model, test_loader, device, args.max_test_batches)
-        # Ground-truth anomaly flag: 1 for the excluded digit, 0 for the 9 normal ones.
+        # Ground-truth anomaly flag: 1 for the excluded digit, 0 for the nine normal ones.
         is_anomaly = (labels == excluded_digit).astype(np.int32)
 
-        # ── Step 4: Metrics ──
+        # ── Step 4: metrics ──
         roc_auc = roc_auc_score(is_anomaly, errors)
         avg_precision = average_precision_score(is_anomaly, errors)
-
-        # Operational threshold: 95th percentile of normal reconstruction errors.
-        # Any test sample scoring above this is flagged as anomalous.
+        # Operational threshold: the 95th percentile of the NORMAL scores, i.e. the
+        # point where we accept a 5 % false-positive rate on known-good data.
         threshold = np.percentile(errors[is_anomaly == 0], 95)
         predicted = errors >= threshold
-        # Fraction of true anomalies that exceed the threshold.
+        # Fraction of true anomalies whose score exceeds that threshold (= recall).
         recall_at_95 = (predicted[is_anomaly == 1].mean()).item()
 
         row = {
@@ -792,13 +815,13 @@ def run_anomaly_experiment(args, train_dataset, test_dataset, run_dir: Path, dev
         anomaly_rows.append(row)
         print(row)
 
-        # ── Step 5: Plot score distributions ──
+        # ── Step 5: plot the score distributions ──
+        # density=True normalises both histograms to unit area, so the heavily
+        # outnumbered anomaly class stays visible next to the normal one.
         plt.figure(figsize=(7, 4))
-        # Normal-class histogram (9 digits)
         plt.hist(errors[is_anomaly == 0], bins=60, alpha=0.7, label="normal", density=True)
-        # Anomaly-class histogram (excluded digit)
         plt.hist(errors[is_anomaly == 1], bins=60, alpha=0.7, label=f"anomaly digit {excluded_digit}", density=True)
-        # Vertical dashed line at the 95th percentile of the normal distribution
+        # Dashed vertical line marking the 95th percentile of the normal scores.
         plt.axvline(threshold, color="black", linestyle="--", linewidth=1, label="normal p95")
         plt.xlabel("reconstruction BCE")
         plt.ylabel("density")
@@ -818,54 +841,34 @@ def run_anomaly_experiment(args, train_dataset, test_dataset, run_dir: Path, dev
 def parse_args():
     """
     Build the ArgumentParser and return the parsed CLI flags.
-    Run ``python cae.py --help`` to see the automatically-generated help text.
+    Run ``python Autoencoder_final.py --help`` for the generated help text.
     """
     parser = argparse.ArgumentParser(description="Autoencoder experiments for MNIST/Fashion-MNIST.")
 
-    # ── Dataset selection ──
-    parser.add_argument("--dataset", choices=["MNIST", "FashionMNIST"], default="MNIST",
-                        help="Which torchvision dataset to use (default: MNIST).")
-    parser.add_argument("--data-dir", type=Path, default=Path("data"),
-                        help="Directory to cache downloaded raw MNIST files (default: ./data).")
-    parser.add_argument("--out-dir",  type=Path, default=Path("runs"),
-                        help="Root directory where run sub-folders and PNGs / CSVs are saved (default: ./runs).")
+    # ── Dataset selection & I/O paths ──
+    parser.add_argument("--dataset", choices=["MNIST", "FashionMNIST"], default="MNIST")   # Dataset to train on
+    parser.add_argument("--data-dir", type=Path, default=Path("data"))                     # Cache dir for raw downloads
+    parser.add_argument("--out-dir", type=Path, default=Path("runs"))                      # Root dir for run artefacts
 
-    # ── Reconstruction-experiment training hyper-parameters ──
-    parser.add_argument("--epochs", type=int, default=10,
-                        help="Number of training epochs per (loss, latent_dim) configuration (default: 10).")
-    parser.add_argument("--batch-size", type=int, default=128,
-                        help="SGD mini-batch size (default: 128).")
-    parser.add_argument("--lr", type=float, default=1e-3,
-                        help="Adam learning rate (default: 0.001).")
-    parser.add_argument("--latent-dims", type=int, nargs="+", default=[2, 8, 32, 128],
-                        help="List of bottleneck sizes to sweep (default: 2 8 32 128).")
-    parser.add_argument("--losses", choices=["bce", "mse"], nargs="+", default=["bce", "mse"],
-                        help="Reconstruction loss functions to compare (default: bce mse).")
+    # ── Reconstruction-sweep training hyper-parameters ──
+    parser.add_argument("--epochs", type=int, default=10)                                  # Epochs per configuration
+    parser.add_argument("--batch-size", type=int, default=128)                             # SGD mini-batch size
+    parser.add_argument("--lr", type=float, default=1e-3)                                  # Adam learning rate
+    parser.add_argument("--latent-dims", type=int, nargs="+", default=[2, 8, 32, 128])     # Bottleneck sizes to sweep
+    parser.add_argument("--losses", choices=["bce", "mse"], nargs="+", default=["bce", "mse"])  # Losses to compare
 
     # ── Infrastructure / reproducibility ──
-    parser.add_argument("--seed", type=int, default=42,
-                        help="Global random seed for deterministic results (default: 42).")
-    parser.add_argument("--num-workers", type=int, default=2,
-                        help="DataLoader worker sub-processes (default: 2).  Set to 0 if debugging.")
-    parser.add_argument("--max-train-batches", type=int, default=None,
-                        help="Cap the number of training batches per epoch (None = all batches).")
-    parser.add_argument("--max-test-batches", type=int, default=None,
-                        help="Cap the number of test batches during evaluation (None = all batches).")
+    parser.add_argument("--seed", type=int, default=42)                                    # Global RNG seed
+    parser.add_argument("--num-workers", type=int, default=2)                              # DataLoader sub-processes (0 to debug)
+    parser.add_argument("--max-train-batches", type=int, default=None)                     # Cap train batches (None = all)
+    parser.add_argument("--max-test-batches", type=int, default=None)                      # Cap test batches (None = all)
 
     # ── Anomaly-detection sub-experiment ──
-    parser.add_argument("--skip-anomaly", action="store_true",
-                        help="If present, skip the anomaly-detection experiment entirely.")
-    parser.add_argument("--anomaly-digits", type=int, nargs="+", default=list(range(10)),
-                        help="Digits to try as anomalies, one-at-a-time (default: 0 1 2 ... 9).")
-    parser.add_argument("--anomaly-loss", choices=["bce", "mse"], default="bce",
-                        help="Loss used to train the anomaly AEs (default: bce).")
-    parser.add_argument("--anomaly-latent-dim", type=int, default=32,
-                        help="Bottleneck size for the anomaly AEs (default: 32).  "
-                             "Can differ from the reconstruction sweep.")
-    parser.add_argument("--anomaly-epochs", type=int, default=5,
-                        help="Training epochs for each anomaly AE (default: 5). "
-                             "Usually shorter than the main run because we only care about ranking.")
-
+    parser.add_argument("--skip-anomaly", action="store_true")                             # Skip the anomaly stage entirely
+    parser.add_argument("--anomaly-digits", type=int, nargs="+", default=list(range(10)))  # Digits held out, one at a time
+    parser.add_argument("--anomaly-loss", choices=["bce", "mse"], default="bce")           # Loss for the anomaly AEs
+    parser.add_argument("--anomaly-latent-dim", type=int, default=32)                      # Bottleneck for the anomaly AEs
+    parser.add_argument("--anomaly-epochs", type=int, default=5)                           # Epochs per anomaly AE
     return parser.parse_args()
 
 
@@ -873,51 +876,48 @@ def main():
     """
     Main execution pipeline:
 
-      1. Parse CLI flags.
-      2. Fix RNG seeds and pick the best available device.
+      1. Parse the CLI flags.
+      2. Fix the RNG seeds and pick the best available device.
       3. Create a unique run directory inside ``--out-dir``.
-      4. Load train / test datasets and build DataLoaders.
-      5. For every combination of (loss, latent_dim):
-            - Train the AE for N epochs.
-            - Log epoch losses.
-            - Save model checkpoint, reconstruction grid, and (if latent_dim==2)
-              2-D latent scatter + interpolation strip.
+      4. Load the train / test datasets and build their DataLoaders.
+      5. For every (loss, latent_dim) combination:
+            - train the AE for N epochs,
+            - log the per-epoch losses,
+            - save the checkpoint, the reconstruction grid and — when
+              latent_dim == 2 — the 2-D latent scatter plus interpolation strip.
       6. Aggregate all logs into a CSV and a comparison plot.
-      7. If --skip-anomaly is not set, run the one-class anomaly experiment
-         for each digit defined by --anomaly-digits.
+      7. Unless --skip-anomaly is set, run the one-class anomaly experiment for
+         every digit listed in --anomaly-digits.
     """
-    # ── 1. Parse args ──
+    # ── 1-2. Args, reproducibility, device ──
     args = parse_args()
-
-    # ── 2. Reproducibility + device ──
     set_seed(args.seed)
     device = get_device()
     print(f"Using device: {device}")
 
-    # ── 3. Create run directory (e.g. ``runs/ae_mnist_seed42/``) ──
+    # ── 3. Run directory, e.g. ``runs/ae_mnist_seed42/`` ──
+    # The dataset and seed are baked into the name so parallel runs never collide.
     run_dir = args.out_dir / f"ae_{args.dataset.lower()}_seed{args.seed}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
     # ── 4. Data ──
     train_dataset = get_dataset(args.dataset, args.data_dir, train=True)
-    test_dataset  = get_dataset(args.dataset, args.data_dir, train=False)
-    train_loader = make_loader(train_dataset, args.batch_size, True,  args.seed, args.num_workers, device)
-    test_loader  = make_loader(test_dataset,  args.batch_size, False, args.seed, args.num_workers, device)
+    test_dataset = get_dataset(args.dataset, args.data_dir, train=False)
+    train_loader = make_loader(train_dataset, args.batch_size, True, args.seed, args.num_workers, device)
+    test_loader = make_loader(test_dataset, args.batch_size, False, args.seed, args.num_workers, device)
 
-    # ── 5. Reconstruction sweep ──
+    # ── 5. Reconstruction sweep over every (loss, latent_dim) pair ──
     all_rows = []
     for loss_name in args.losses:
         for latent_dim in args.latent_dims:
-            _, rows = train_ae_for_latent_dim(
-                args, latent_dim, loss_name, train_loader, test_loader, run_dir, device
-            )
+            _, rows = train_ae_for_latent_dim(args, latent_dim, loss_name, train_loader, test_loader, run_dir, device)
             all_rows.extend(rows)
 
-    # ── 6. Save aggregated logs and comparison plot ──
+    # ── 6. Save the aggregated epoch log and the comparison plot ──
     pd.DataFrame(all_rows).to_csv(run_dir / "experiment_log.csv", index=False)
     save_loss_comparison(all_rows, run_dir)
 
-    # ── 7. Optionally run anomaly detection ──
+    # ── 7. Optional anomaly-detection experiment ──
     if not args.skip_anomaly:
         anomaly_rows = run_anomaly_experiment(args, train_dataset, test_dataset, run_dir, device)
         pd.DataFrame(anomaly_rows).to_csv(run_dir / "anomaly_log.csv", index=False)
@@ -925,8 +925,8 @@ def main():
     print(f"Done. Results saved to: {run_dir.resolve()}")
 
 
-# Python entry-point guard: only execute `main()` when the script is launched
-# directly by the interpreter, NOT when it is imported as a module.
-# This allows other scripts to ``import cae`` and reuse the classes/functions.
+# Python entry-point guard: run main() only when this file is executed directly,
+# not when it is imported.  That lets another script ``import Autoencoder_final``
+# and reuse ConvAutoencoder or the helper functions without triggering training.
 if __name__ == "__main__":
     main()
